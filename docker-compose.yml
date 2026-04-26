@@ -1,0 +1,51 @@
+services:
+  bot:
+    # In productie: image din DockerHub. Pentru build local, comenteaza
+    # `image:` si decomenteaza `build:`.
+    image: sdancri/trading-bot-boilerplate:latest
+    # build: .
+    container_name: ${BOT_NAME:-trading-bot}
+    restart: unless-stopped
+    # env_file functioneaza cu `docker compose` CLI (nu si in Portainer
+    # Stacks). Sintaxa ${VAR:-default} de mai jos face stack-ul compatibil
+    # cu ambele: vine din .env LOCAL, sau din UI-ul Portainer.
+    env_file: .env
+    environment:
+      BOT_NAME:          ${BOT_NAME:-trading-bot}
+      SYMBOL:            ${SYMBOL:-BTCUSDT}
+      STRATEGY_NAME:     ${STRATEGY_NAME:-}
+      STRATEGY_MODULE:   ${STRATEGY_MODULE:-strategies.example_strategy}
+      STRATEGY_CLASS:    ${STRATEGY_CLASS:-ExampleStrategy}
+      CHART_PORT:        ${CHART_PORT:-8090}
+      CHART_TZ:          ${CHART_TZ:-Europe/Bucharest}
+      ACCOUNT_SIZE:      ${ACCOUNT_SIZE:-100.0}
+      DATA_DIR:          ${DATA_DIR:-/data}
+      RESET_TOKEN:       ${RESET_TOKEN:-}
+      BYBIT_API_KEY:     ${BYBIT_API_KEY:-}
+      BYBIT_API_SECRET:  ${BYBIT_API_SECRET:-}
+      TELEGRAM_TOKEN:    ${TELEGRAM_TOKEN:-}
+      TELEGRAM_CHAT_ID:  ${TELEGRAM_CHAT_ID:-}
+      TZ:                ${TZ:-Europe/Bucharest}
+    ports:
+      - "${CHART_PORT:-8090}:${CHART_PORT:-8090}"
+    volumes:
+      # Strategia + static — read-only pt hot-reload code in dev
+      - ./strategies:/app/strategies:ro
+      - ./static:/app/static:ro
+      # State persistent (bot_state.json) — supravietuieste restart/upgrade
+      - bot-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:${CHART_PORT:-8090}/api/status"]
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 3
+
+volumes:
+  bot-data:
+    name: ${BOT_NAME:-trading-bot}-data

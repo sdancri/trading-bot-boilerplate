@@ -1,0 +1,20 @@
+# Optional — librarii pentru indicatori avansati & backtest.
+# Instaleaza cu: pip install -r requirements-extra.txt
+#
+# NU sunt necesare pentru boilerplate — doar daca strategiile tale folosesc
+# indicatori mai complecsi decat EMA/SMA/RSI manual.
+
+# pandas-ta: 130+ indicatori (MACD, Ichimoku, VWAP, ADX, etc.)
+# Pure Python, lightweight (nu are dependente nativ/C)
+pandas-ta==0.3.14b0
+
+# Alternativa: TA-Lib (C bindings — mai rapid dar necesita libta-lib.so pe sistem)
+# Pe Linux Mint/Ubuntu: apt install ta-lib
+# Decomenteaza daca ai nevoie:
+# TA-Lib==0.4.32
+
+# scikit-learn: pentru strategii cu ML (clustering, regresie, etc.)
+# scikit-learn==1.6.0
+
+# plotly: daca vrei sa generezi raporturi PDF/HTML in afara chart-ului live
+# plotly==5.24.1
