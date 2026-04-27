@@ -69,6 +69,40 @@ from strategies.base_strategy import Strategy, StrategyContext
 
 
 # ============================================================================
+# Last-resort crash handler — captureaza exceptii Python necapturate
+# (NU prinde SIGKILL, OOM kill, segfault — pt ăstea trebuie watchdog extern)
+# ============================================================================
+
+def _crash_excepthook(exc_type, exc_value, tb):
+    import traceback
+    err_text = ''.join(traceback.format_exception(exc_type, exc_value, tb))
+    # log local intai (chiar daca TG eseueaza)
+    print(f"[CRASH] uncaught {exc_type.__name__}: {exc_value}", file=_sys.stderr)
+    print(err_text, file=_sys.stderr)
+    # Trimit TG sincron via httpx, evit asyncio (event loop poate fi deja mort)
+    try:
+        import httpx as _httpx, html as _html
+        token = os.getenv("TELEGRAM_TOKEN", "")
+        chat = os.getenv("TELEGRAM_CHAT_ID", "")
+        if token and chat:
+            name = _html.escape(os.getenv("BOT_NAME", "bot"))
+            sym  = _html.escape(os.getenv("SYMBOL", ""))
+            head = f"🤖 <b>[{name}]</b> <code>{sym}</code>" if sym else f"🤖 <b>[{name}]</b>"
+            tb_short = _html.escape(err_text[-1500:])  # ultima parte din stack
+            text = f"{head}\n<b>BOT CRASHED 💥</b>\n<code>{exc_type.__name__}: {_html.escape(str(exc_value))[:200]}</code>\n<pre>{tb_short}</pre>"
+            _httpx.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat, "text": text, "parse_mode": "HTML"},
+                        timeout=5)
+    except Exception:
+        pass
+    # respect default behavior — print + exit nonzero
+    _sys.__excepthook__(exc_type, exc_value, tb)
+
+
+_sys.excepthook = _crash_excepthook
+
+
+# ============================================================================
 # Config
 # ============================================================================
 
@@ -360,7 +394,6 @@ async def _bootstrap() -> None:
         "BOT STARTED ✅",
         f"Strategy: <code>{_strategy.name}</code>\n"
         f"Account init: ${_state.initial_account:,.2f}\n"
-        f"History loaded: {len(_strategy.history):,} candles\n"
         f"Chart: port {CHART_PORT}"
     )
 
@@ -638,7 +671,21 @@ async def lifespan(app: FastAPI):
         on_execution=_on_execution_event,
         on_position=_on_position_event,
     ))
-    yield
+    try:
+        yield
+    finally:
+        # Shutdown notification
+        try:
+            ret_pct = (_state.account - _state.initial_account) / _state.initial_account * 100
+            n_trades = len(_state.equity_curve) - 1 if _state.equity_curve else 0
+            await tg.send(
+                "BOT STOPPED 🛑",
+                f"Strategy: <code>{_strategy.name if _strategy else '?'}</code>\n"
+                f"Account: ${_state.account:,.2f}  |  Return: {ret_pct:+.2f}%\n"
+                f"Trades: {n_trades}"
+            )
+        except Exception as e:
+            print(f"  [SHUTDOWN] tg.send failed: {e}")
 
 
 app = FastAPI(lifespan=lifespan, title=f"{BOT_NAME} chart")
@@ -650,12 +697,29 @@ async def root():
     return FileResponse(os.path.join(STATIC, "chart_live.html"))
 
 
+def _tf_label(interval: str) -> str:
+    """Bybit kline interval ('1','5','60','240','D','W','M') → friendly ('1m','5m','1h','4h','1d','1w','1M')."""
+    mapping = {"D": "1d", "W": "1w", "M": "1M"}
+    if interval in mapping:
+        return mapping[interval]
+    try:
+        n = int(interval)
+    except ValueError:
+        return interval
+    if n < 60:
+        return f"{n}m"
+    if n % 60 == 0:
+        return f"{n // 60}h"
+    return f"{n}m"
+
+
 @app.get("/api/init")
 async def api_init():
     """Payload pentru chart la load."""
     return JSONResponse({
         "candles":         _candles,        # doar cele de la prima pornire
         "active_position": _active_position, # None daca nu e pozitie deschisa
+        "timeframe":       _tf_label(WS_INTERVAL),
         **_state.init_payload(),
     })
 

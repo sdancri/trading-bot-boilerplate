@@ -14,6 +14,7 @@ Utilizare:
 """
 from __future__ import annotations
 
+import html
 import os
 import httpx
 
@@ -25,10 +26,13 @@ def _header() -> str:
     Header standard pt fiecare mesaj. Format:
         🤖 [BOT_NAME · STRATEGY_NAME] SYMBOL    (daca STRATEGY_NAME e setat)
         🤖 [BOT_NAME] SYMBOL                     (altfel)
+
+    Valorile env sunt HTML-escaped — protectie impotriva 400 "can't parse
+    entities" daca cineva seteaza un nume cu `<`, `>` sau `&` in valoare.
     """
-    name     = os.getenv("BOT_NAME", "bot")
-    strategy = os.getenv("STRATEGY_NAME", "").strip()
-    symbol   = os.getenv("SYMBOL",  "")
+    name     = html.escape(os.getenv("BOT_NAME", "bot"))
+    strategy = html.escape(os.getenv("STRATEGY_NAME", "").strip())
+    symbol   = html.escape(os.getenv("SYMBOL",  ""))
     label    = f"{name} · {strategy}" if strategy else name
     if symbol:
         return f"🤖 <b>[{label}]</b> <code>{symbol}</code>"
@@ -42,9 +46,13 @@ async def send(title: str, body: str = "") -> None:
         <b>TITLE</b>
         body
 
-    Daca `body` e gol, `title` apare singur sub header.
+    `title` e HTML-escaped (e text plain). `body` NU e escape-uit — caller-ul
+    e responsabil sa foloseasca tag-uri HTML valide (ex: <code>, <b>) si sa
+    nu insereze `<` literal in valori dinamice (foloseste html.escape() daca
+    interpolezi text necontrolat).
     """
-    text = f"{_header()}\n<b>{title}</b>"
+    safe_title = html.escape(title)
+    text = f"{_header()}\n<b>{safe_title}</b>"
     if body:
         text += f"\n{body}"
     await send_raw(text)
@@ -66,6 +74,6 @@ async def send_raw(text: str) -> None:
                 "disable_web_page_preview": True,
             })
             if r.status_code != 200:
-                print(f"  [TG] HTTP {r.status_code}: {r.text[:120]}")
+                print(f"  [TG] HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"  [TG] error: {e}")

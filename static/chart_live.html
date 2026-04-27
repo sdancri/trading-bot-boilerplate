@@ -258,10 +258,11 @@
 // ============================================================================
 // Config primit prin /api/init
 // ============================================================================
-let CHART_TZ = "Europe/Bucharest";
-let BOT_NAME = "bot";
-let STRATEGY = "";
-let SYMBOL   = "BTCUSDT";
+let CHART_TZ  = "Europe/Bucharest";
+let BOT_NAME  = "bot";
+let STRATEGY  = "";
+let SYMBOL    = "BTCUSDT";
+let TIMEFRAME = "";
 let INITIAL_ACCOUNT = 100.0;
 let FIRST_TS = null;        // s UTC — afisam doar lumanari >= asta
 let initDone = false;
@@ -726,13 +727,15 @@ async function loadInit() {
   BOT_NAME        = data.bot_name || "bot";
   STRATEGY        = data.strategy || "";
   SYMBOL          = data.symbol   || "BTCUSDT";
+  TIMEFRAME       = data.timeframe || "";
   INITIAL_ACCOUNT = data.summary.initial_account;
   FIRST_TS        = data.first_ts;
 
   const titleLabel = STRATEGY ? `[${BOT_NAME} · ${STRATEGY}]` : `[${BOT_NAME}]`;
   document.title = `${titleLabel} ${SYMBOL}`;
   document.getElementById("title-text").textContent = `${titleLabel} ${SYMBOL} — live`;
-  document.getElementById("sym-lbl").textContent    = `${SYMBOL} · live · ${CHART_TZ}`;
+  const tfLabel = TIMEFRAME || "live";
+  document.getElementById("sym-lbl").textContent    = `${SYMBOL} · ${tfLabel} · ${CHART_TZ}`;
 
   // Candles
   CANDLES = (data.candles || []).map(c => ({
