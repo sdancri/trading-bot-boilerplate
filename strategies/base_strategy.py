@@ -35,6 +35,11 @@ if TYPE_CHECKING:
 
 # =============================================================================
 # 1. SL LIMITS — validare distanta stop-loss
+#
+# (Pt LEVERAGE_MAX cap vezi core/position_sizing.py: capul se aplica automat
+#  in qty_by_risk()/sizing_snapshot() cand strategia paseaza `bybit_balance`.
+#  USER-UL TREBUIE sa fi setat acelasi leverage in UI Bybit — botul nu il
+#  schimba via API.)
 # =============================================================================
 
 def _sl_min_pct() -> float:

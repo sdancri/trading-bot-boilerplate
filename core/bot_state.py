@@ -1,27 +1,23 @@
 """
 bot_state.py — State management pentru bot
 ==========================================
-Tine state-ul botului (account, trades, equity_curve, indicators) si optional
-il persista pe disk in ${DATA_DIR}/bot_state.json (default DATA_DIR=/data).
+Tine state-ul botului (account, trades, equity_curve, indicators).
 
-  - account: porneste la ACCOUNT_SIZE ($100) si creste/scade DOAR cu
-    PnL-ul real tras de pe Bybit dupa fiecare trade inchis.
-  - trades: lista de traduri inchise (pt panelul lateral al chart-ului)
+  - account: porneste la ACCOUNT_SIZE si creste/scade DOAR cu PnL-ul real
+    tras de pe Bybit dupa fiecare trade inchis.
+  - trades: lista de trade-uri inchise (pt panelul lateral al chart-ului)
   - equity_curve: (timestamp, equity) dupa fiecare trade
   - first_candle_ts: timestamp-ul primei lumanari primite dupa start
 
-PERSISTENTA + RESET_TOKEN:
-  Daca DATA_DIR exista, BotState.load() incarca state-ul anterior din
-  ${DATA_DIR}/bot_state.json si BotState.save() il scrie inapoi.
+PERSISTENTA — DEFAULT OFF:
+  Modelul boilerplate-ului: la fiecare Restart, istoric+equity = de la 0.
+  Pt asta lasi `DATA_DIR=` gol (default in .env.example).
 
-  Mecanism reset controlat: env var `RESET_TOKEN`. Token-ul se salveaza
-  in fisier; daca env-ul difera de cel stocat la urmatorul start, statul
-  e curatat (history=[], account=initial_account) si se rescrie cu noul
-  token. Lasa env var-ul gol -> niciodata reset. Schimba-i valoarea
-  (ex: v1 -> v2) ca sa fortezi reset la urmatoarea pornire.
-
-  Safe la crash-restart loops: token-ul ramane acelasi cat timp env-ul
-  nu se schimba.
+  Daca vrei totusi persistenta intre restart-uri, set `DATA_DIR=/data`:
+    - BotState.load() incarca state anterior din ${DATA_DIR}/bot_state.json
+    - BotState.save() il scrie inapoi dupa fiecare trade
+    - `RESET_TOKEN` env permite wipe controlat: schimba valoarea -> wipe la
+      urmatorul start. Token gol = niciodata wipe. Safe la crash loops.
 """
 from __future__ import annotations
 

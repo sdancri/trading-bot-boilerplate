@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import core.exchange_api as ex
+import core.telegram_bot as tg
 from core.bot_state import ReconciliationError
 from strategies.base_strategy import Strategy, StrategyContext, validate_sl
 
@@ -172,27 +173,48 @@ class ExampleStrategy(Strategy):
             print(f"  [{self.name}] SKIP {direction} — {reason}")
             return
 
-        # Qty — din ACCOUNT INITIAL (nu compound — precum cere specificatia)
-        account_init = ctx.state.initial_account
+        # Qty — din ACCOUNT INITIAL (nu compound — precum cere specificatia).
+        # Trecem si bybit_balance la sizing_snapshot ca position_sizing sa
+        # aplice automat capul: notional <= 0.95 × bybit_balance × LEVERAGE_MAX
+        # (anti-rejection Bybit cand notional dorit > balance × leverage).
+        account_init  = ctx.state.initial_account
+        bybit_balance = await ex.get_balance() or 0.0
         snap = ex.sizing_snapshot(
             balance=account_init,
             risk_frac=RISK_FRAC,
             entry_price=entry,
             sl_price=sl,
+            bybit_balance=bybit_balance,
         )
         qty = snap["qty"]
         if qty <= 0:
             print(f"  [{self.name}] SKIP {direction} — qty=0")
             return
+        if snap.get("capped"):
+            print(f"  [{self.name}] qty CAPPED: notional ${snap['notional']:.0f} "
+                  f"-> ${snap['actual_notional']:.0f}  "
+                  f"(max=0.95 × ${bybit_balance:.0f} × {snap['leverage_max']}x)")
 
-        # Plaseaza market order (Market pt simplicitate in exemplu;
-        # productie: foloseste stop-limit pt maker fee)
-        order_id = await ex.place_market(self.symbol, side, qty)
-        if not order_id:
-            print(f"  [{self.name}] order FAILED")
+        # ENTRY ca MAKER cu fallback Market (pattern 80/20):
+        # plaseaza Limit PostOnly la best bid/ask, asteapta `timeout_sec`,
+        # daca nu s-a umplut -> cancel + Market doar pe REMAINDER (anti-double-fill).
+        # Captureaza ~80-90% din economia de fee fata de un chase complet.
+        result = await ex.maker_entry_or_market(
+            symbol=self.symbol, side=side, qty=qty,
+            top=None,            # None -> REST get_ticker intern (latenta neglijabila)
+            timeout_sec=5,       # entry_breakout: 3, mean_rev: 5-7, exit_TP: 10
+        )
+        if result["filled_qty"] <= 0:
+            print(f"  [{self.name}] entry FAILED ({result['result']}) — skip")
             return
+        # Loghez tipul fill-ului — dupa ~100 trades ai date sa decizi timeout
+        print(f"  [{self.name}] entry {result['result']} "
+              f"filled={result['filled_qty']} avg={result['avg_price']:.2f}")
+        # avg_price din Bybit (pentru "mixed" e doar leg-ul maker — slippage
+        # real vine la close cand fetch_pnl_for_trade trage avg ponderat)
+        entry = result["avg_price"] or entry
 
-        # Seteaza SL pe pozitie
+        # Seteaza SL pe pozitie (Market la trigger pt siguranta vs gap)
         await ex.set_position_sl(self.symbol, sl)
 
         # Store trade state
@@ -204,16 +226,43 @@ class ExampleStrategy(Strategy):
         self._tp_price    = tp
         self._qty         = qty
 
+        # Asset de baza pt afisare. Normalizeaza la uppercase si scoate sufix
+        # `.P` (TradingView perp notation), apoi taie quote-ul:
+        #   BTCUSDT          -> BTC
+        #   1000000OMGUSDT.P -> 1000000OMG
+        #   ETHUSD           -> ETH
+        base_asset = self.symbol.upper()
+        if base_asset.endswith(".P"):
+            base_asset = base_asset[:-2]
+        for quote in ("USDT", "USDC", "USD"):
+            if base_asset.endswith(quote):
+                base_asset = base_asset[:-len(quote)]
+                break
+
         dir_icon = "🚀" if direction == "LONG" else "📉"
+        if snap.get("capped"):
+            cap_line = (
+                f"\n⚠️ <b>POZITIE CAPPED</b>\n"
+                f"   Notional dorit:   ${snap['notional']:,.2f}\n"
+                f"   Notional aplicat: ${snap['actual_notional']:,.2f}\n"
+                f"   Cap formula:      0.95 × ${bybit_balance:,.2f} × "
+                f"{snap['leverage_max']:g}x = ${snap['max_notional']:,.2f}\n"
+                f"   Risk efectiv:     ${snap['actual_risk']:,.2f} "
+                f"(in loc de ${snap['risk_amount']:,.2f})"
+            )
+        else:
+            cap_line = ""
         await ctx.send_telegram(
             f"{dir_icon} ENTRY {direction}",
             f"<b>Strategy:</b> <code>{self.name}</code>\n"
+            f"Time:     {tg.fmt_time(ts)}\n"
             f"Entry:    {entry:.2f}\n"
             f"SL:       {sl:.2f}  ({snap['sl_pct']:.3f}%)\n"
             f"TP:       {tp:.2f}  ({TP_PCT}%)\n"
-            f"Qty:      {qty} {self.symbol[:-4]}\n"
+            f"Qty:      {qty} {base_asset}\n"
             f"Notional: ${snap['actual_notional']:.2f}\n"
             f"Risk:     ${snap['actual_risk']:.2f}  ({RISK_FRAC*100:.0f}% din ${account_init:.0f})"
+            f"{cap_line}"
         )
 
     # ------------------------------------------------------------------

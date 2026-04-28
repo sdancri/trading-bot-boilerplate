@@ -16,7 +16,7 @@ Functii disponibile pentru strategii:
     get_kline(symbol, interval, limit)    -> list[dict]
 
   Account:
-    get_balance()                         -> float (USDT disponibil)
+    get_balance()                         -> float (USDT disponibil — pt cap leverage)
     get_position_qty(symbol)              -> float (BTC cantitate)
 
   Orders:
@@ -197,11 +197,10 @@ async def get_balance() -> Optional[float]:
     """
     USDT disponibil — conturi UNIFIED.
 
-    ⚠️  DEBUG-ONLY. NU folosi pt equity/sizing.
-    Bot-ul are propriul equity local in BotState.account care se actualizeaza
-    STRICT cu PnL-ul real tras de pe Bybit dupa fiecare trade inchis.
-    Aceasta functie este expusa DOAR pt debugging manual (ex: verificare
-    ad-hoc a balance-ului real vs equity-ul local pt detectare drift).
+    Folosit DOAR pt cap-ul de siguranta din position_sizing:
+        notional_max = 0.95 × bybit_balance × LEVERAGE_MAX
+    Equity-ul afisat pe chart ramane local (state.account += trade.pnl) —
+    NU se inlocuieste cu balance-ul real.
     """
     r = await _get("/v5/account/wallet-balance",
                    {"accountType": "UNIFIED", "coin": "USDT"})
@@ -344,17 +343,18 @@ async def fetch_pnl_for_trade(symbol: str,
 # ============================================================================
 
 def calc_qty_by_risk(balance: float, risk_frac: float, sl_dist: float,
-                     entry_price: Optional[float] = None) -> float:
+                     entry_price: Optional[float] = None,
+                     bybit_balance: Optional[float] = None) -> float:
     """
     qty = (balance * risk_frac) / sl_dist  — formula clasica in absoluti.
 
-    LEVERAGE NU INTRA IN CALCUL. Formula echivalenta:
+    LEVERAGE NU INTRA IN FORMULA. Echivalent:
         notional = risk$ * 100 / SL%
         qty      = notional / price
 
-    Pastrat cu aceasta signatura pt compat cu codul ORB vechi.
-    Daca `entry_price` e dat, deleg la position_sizing.qty_by_risk (mai robust
-    la rotunjiri).
+    Cap automat (anti-rejection Bybit) cand `entry_price` SI `bybit_balance`
+    sunt date:
+        notional_capped = min(notional, 0.95 × bybit_balance × LEVERAGE_MAX)
     """
     if sl_dist <= 0 or risk_frac <= 0 or balance <= 0:
         return 0.0
@@ -368,22 +368,28 @@ def calc_qty_by_risk(balance: float, risk_frac: float, sl_dist: float,
             sl_price=entry_price - sl_dist,   # direction-agnostic — |dist|
             qty_step=_qty_step(),
             qty_precision=_qty_prec(),
+            bybit_balance=bybit_balance,
         )
 
-    # Legacy path — fara entry_price
+    # Legacy path — fara entry_price (capul nu se aplica)
     raw = (balance * risk_frac) / sl_dist
     step = _qty_step()
     return round(math.floor(raw / step) * step, _qty_prec())
 
 
 def sizing_snapshot(balance: float, risk_frac: float,
-                    entry_price: float, sl_price: float) -> dict:
-    """Snapshot complet pt logging/Telegram (fara leverage)."""
+                    entry_price: float, sl_price: float,
+                    bybit_balance: Optional[float] = None) -> dict:
+    """
+    Snapshot complet pt logging/Telegram. Daca pasezi `bybit_balance`, dict-ul
+    include si capul `max_notional` + flag-ul `capped`.
+    """
     import core.position_sizing as ps
     return ps.sizing_snapshot(
         balance=balance, risk_frac=risk_frac,
         entry_price=entry_price, sl_price=sl_price,
         qty_step=_qty_step(), qty_precision=_qty_prec(),
+        bybit_balance=bybit_balance,
     )
 
 
@@ -461,6 +467,40 @@ async def cancel_order(symbol: str, order_id: Optional[str]) -> None:
     })
 
 
+async def amend_order(symbol: str, order_id: str,
+                      price: Optional[float] = None,
+                      qty:   Optional[float] = None) -> bool:
+    """
+    Modifica pretul si/sau qty unui ordin EXISTENT (pastreaza order_id si
+    pozitia in queue daca pretul nu s-a schimbat). 1 API call vs 2 (cancel+create).
+
+    Returneaza True daca Bybit a confirmat amendul, False altfel (incl. cazul
+    cand ordinul a fost deja umplut sau respins de PostOnly check).
+    """
+    payload: dict = {"category": _cat(), "symbol": symbol, "orderId": order_id}
+    if price is not None:
+        payload["price"] = _fmt_price(price)
+    if qty is not None:
+        payload["qty"] = _fmt_qty(qty)
+    r = await _post("/v5/order/amend", payload)
+    return r is not None
+
+
+async def get_order_status(symbol: str, order_id: str) -> Optional[dict]:
+    """
+    Status detaliat al unui ordin (open sau recent inchis). Returneaza None
+    daca ordinul nu mai exista in cache-ul Bybit.
+
+    Field-uri relevante: orderStatus (New/PartiallyFilled/Filled/Cancelled/Rejected),
+    cumExecQty, leavesQty, avgPrice, rejectReason.
+    """
+    r = await _get("/v5/order/realtime",
+                   {"category": _cat(), "symbol": symbol, "orderId": order_id})
+    if not r or not r.get("list"):
+        return None
+    return r["list"][0]
+
+
 async def cancel_all_stops(symbol: str) -> None:
     await _post("/v5/order/cancel-all", {
         "category":    _cat(),
@@ -470,6 +510,49 @@ async def cancel_all_stops(symbol: str) -> None:
 
 
 async def set_position_sl(symbol: str, sl_price: float) -> None:
+    """
+    Atașează SL la pozitia activa via /v5/position/set-trading-stop.
+    SL e implicit Market (slOrderType=Market) — siguranta executiei.
+
+    RECOMANDARE PT STRATEGII CARE STIU SL+TP LA DESCHIDEREA TRADEULUI:
+    -----------------------------------------------------------------
+    In loc sa monitorizezi TP-ul intra-bar din strategie (pattern v1
+    sau chase_close manual), atașează AMBELE SL+TP la pozitie intr-un
+    singur call. Bybit gestioneaza totul (cancel-on-close, replace pe
+    pyramidari, garantie executie).
+
+    Cheia e `tpOrderType=Limit` cu `tpLimitPrice`: la trigger Bybit
+    plaseaza un LIMIT order @ tp_limit_price → maker fee 0.020% in loc
+    de 0.055% taker. SL ramane Market pt siguranta.
+
+    Exemplu payload (LONG, entry=$100, SL=$97, TP=$104):
+
+        await _post("/v5/position/set-trading-stop", {
+            "category":     "linear",
+            "symbol":       "ETHUSDT",
+            "positionIdx":  0,
+            # SL = market (siguranta)
+            "stopLoss":     "97.00",
+            "slTriggerBy":  "LastPrice",
+            "slOrderType":  "Market",
+            # TP = limit (maker fee)
+            "takeProfit":   "104.00",
+            "tpTriggerBy":  "LastPrice",
+            "tpOrderType":  "Limit",
+            "tpLimitPrice": "103.95",   # ~0.05% mai prost ca trigger pt fill prob
+        })
+
+    Pentru SHORT: simetric, tpLimitPrice cu ~0.05% mai sus decat trigger.
+
+    Edge case: pe spike-through (pretul sare peste TP fara fill volume),
+    limit-ul sit pana cand pretul revine. Mitigare = `tpLimitPrice` mai
+    prost decat `takeProfit`. Pe TF mari (>= 30m) si TP-uri ample (>= 2×ATR)
+    edge case-ul e foarte rar.
+
+    NU folosi tpOrderType=Limit fara tpLimitPrice — Bybit returneaza eroare
+    sau plaseaza limit-ul exact la trigger (maker incert daca pretul nu
+    continua sa miste in directia ta).
+    """
     await _post("/v5/position/set-trading-stop", {
         "category":    _cat(),
         "symbol":      symbol,
@@ -477,6 +560,159 @@ async def set_position_sl(symbol: str, sl_price: float) -> None:
         "slTriggerBy": "LastPrice",
         "positionIdx": 0,
     })
+
+
+# ============================================================================
+# Maker entry helper — Limit PostOnly cu fallback Market pe remainder
+# ============================================================================
+#
+# Bybit V5 nu are "chase order" nativ (verificat in /v5/order/create endpoint).
+# Pentru maker fee la entry, foloseste pattern-ul "try maker once, fallback
+# Market pe ce a ramas dupa timeout" — mult mai simplu decat un chase complet
+# (~25 linii vs 200+) si captureaza ~80-90% din economia de fee.
+#
+# Detalii bug-uri evitate:
+#   1. NU folosim get_position_qty pt detectare fill — fragil cu pyramiding
+#      (pozitia preexistenta poate face check-ul fals-pozitiv).
+#      In schimb interogam orderStatus din /v5/order/realtime.
+#   2. La timeout, market doar pe `qty - cumExecQty`, nu pe qty intreg —
+#      altfel double-fill garantat la partial.
+#   3. Pe PostOnly rejection (piata s-a miscat in fereastra de plasare),
+#      place_limit_postonly returneaza None instant → fallback Market imediat,
+#      nu astepta timeout-ul degeaba.
+
+
+async def maker_entry_or_market(symbol:      str,
+                                side:        str,           # "Buy" / "Sell"
+                                qty:         float,
+                                top:         Optional[dict] = None,
+                                timeout_sec: int   = 5,
+                                fallback:    str   = "market",   # "market" | "skip"
+                                min_qty:     float = 0.0,
+                                reduce_only: bool  = False) -> dict:
+    """
+    Entry MAKER cu fallback configurabil pe remainder. Pattern 80/20 — captureaza
+    ~80-90% din economia de fee fata de un chase complet, ~50 linii.
+
+    Pasi:
+      1. Plaseaza Limit PostOnly la best bid (Buy) / best ask (Sell).
+         Daca PostOnly e respins instant (piata s-a miscat) -> fallback imediat.
+      2. Astepta `timeout_sec` x 1s. Verifica orderStatus dupa fiecare secunda.
+         Daca orderStatus == "Filled" -> succes ca maker.
+      3. Timeout -> cancel ordinul. Verifica `cumExecQty`.
+         - fallback="market": Market pe REMAINDER (anti-double-fill).
+         - fallback="skip":   nu mai trimite Market — accepti underfill total
+                              (sau partial-fill maker daca a fost partial).
+
+    REGULA MENTALA pt alegerea fallback:
+        - Daca pierderea de a NU intra/iesi < costul taker  -> fallback="skip"
+        - Daca pierderea de a NU intra/iesi >= costul taker -> fallback="market"
+        - Orice exit de PROTECTIE (SL/trail/BE) -> NU folosi pattern-ul,
+          place_market direct (siguranta executiei > economia de fee).
+
+    GHID timeout_sec + fallback per scenariu:
+
+        ENTRIES                                 timeout  fallback
+          - Breakout / volatil                    3s     market
+          - Mean reversion / calm                 5-7s   market
+
+        EXITS PROFIT                            timeout  fallback
+          - TP final (close all, ai timp)        10s     market
+          - TP partial (scale-out, runner ramane) 15-20s skip sau market
+            (daca pierzi TP partial, runner-ul preia profitul oricum)
+
+        ADAOSURI POZITIE                        timeout  fallback
+          - Pyramidare (optionala prin definitie) 5s     skip
+            (taker-ul anuleaza economia + adauga slippage; mai bine ratezi
+             adaugarea decat sa fortezi fill cu cost)
+
+        NU FOLOSI PATTERN-UL (Market direct, fara helper):
+          - Stop loss
+          - Trailing stop
+          - Break-even stop
+          - Orice exit de protecție / risk management
+
+    Args:
+      top:         {"bid","ask"} sau None -> se face REST get_ticker intern.
+      timeout_sec: vezi ghid de mai sus.
+      fallback:    "market" sau "skip". Daca "skip", la timeout nu se plaseaza
+                   Market — strategia primeste cum_qty real si decide ea.
+      min_qty:     prag minim sub care nu se trimite Market la fallback="market"
+                   (qty step — eviti reject-uri pe ordere prea mici).
+      reduce_only: True pt EXIT-uri (TP, scale-out). False pt ENTRY/pyramidare.
+
+    Returneaza:
+      {
+        "result":     "maker"   - filled 100% maker
+                      "taker"   - rejection imediata SAU 100% market fallback
+                      "mixed"   - partial maker + market remainder
+                      "skipped" - timeout cu fallback="skip" (filled_qty 0 sau partial)
+                      "failed"  - place_market a esuat (caz rar; logat),
+        "filled_qty":   float,    # cantitate reala fillata (poate fi < qty pe skip)
+        "avg_price":    float,    # avg maker din Bybit; pe mixed/taker e estimativ
+      }
+    """
+    # Top of book — REST fallback daca nu primim de la caller
+    if top is None:
+        t = await get_ticker(symbol)
+        top = {"bid": t["bid1"], "ask": t["ask1"]} if t else {}
+    px = top.get("bid") if side == "Buy" else top.get("ask")
+    if not px:
+        # Niciun top -> direct Market (sau skip)
+        if fallback == "skip":
+            return {"result": "skipped", "filled_qty": 0.0, "avg_price": 0.0}
+        market_id = await place_market(symbol, side, qty, reduce_only=reduce_only)
+        return {"result": "taker" if market_id else "failed",
+                "filled_qty": qty if market_id else 0.0,
+                "avg_price":  0.0}
+
+    # 1. Plasare maker. None -> rejection PostOnly sau alt error.
+    oid = await place_limit_postonly(symbol, side, px, qty,
+                                     reduce_only=reduce_only)
+    if not oid:
+        # Bug fix #3: NU astepta timeout. Fallback imediat (sau skip).
+        if fallback == "skip":
+            return {"result": "skipped", "filled_qty": 0.0, "avg_price": 0.0}
+        market_id = await place_market(symbol, side, qty, reduce_only=reduce_only)
+        return {"result": "taker" if market_id else "failed",
+                "filled_qty": qty if market_id else 0.0,
+                "avg_price":  0.0}
+
+    # 2. Poll order status (NU position qty — bug fix #1, evita probleme cu pyramiding)
+    for _ in range(timeout_sec):
+        await asyncio.sleep(1)
+        st = await get_order_status(symbol, oid)
+        if st and st.get("orderStatus") == "Filled":
+            return {"result": "maker",
+                    "filled_qty": float(st.get("cumExecQty", qty) or qty),
+                    "avg_price":  float(st.get("avgPrice",   px) or px)}
+
+    # 3. Timeout — cancel + verifica cumExecQty (bug fix #2: market doar pe remainder)
+    await cancel_order(symbol, oid)
+    final = await get_order_status(symbol, oid)
+    cum_qty   = float(final.get("cumExecQty", 0) or 0) if final else 0.0
+    avg_maker = float(final.get("avgPrice",   0) or 0) if final else 0.0
+    remaining = max(qty - cum_qty, 0.0)
+
+    if fallback == "skip":
+        # Strategia accepta underfill — returnam ce am obtinut maker (poate fi 0)
+        return {"result": "skipped",
+                "filled_qty": cum_qty,
+                "avg_price":  avg_maker}
+
+    # fallback == "market": completeaza pe remainder
+    if remaining > min_qty:
+        await place_market(symbol, side, remaining, reduce_only=reduce_only)
+
+    if cum_qty > 0:
+        return {"result": "mixed",
+                "filled_qty": qty,         # presupunem market a fillat restul
+                "avg_price":  avg_maker}   # avg afisat e cel maker; slippage real
+                                            # vine cand fetch_pnl_for_trade trage
+                                            # avg-ul ponderat de pe Bybit
+    return {"result": "taker",
+            "filled_qty": qty,
+            "avg_price":  0.0}
 
 
 # ============================================================================

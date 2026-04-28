@@ -16,9 +16,39 @@ from __future__ import annotations
 
 import html
 import os
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 import httpx
 
 TELEGRAM_API = "https://api.telegram.org"
+
+_DAYS_RO = ["Luni", "Marti", "Miercuri", "Joi", "Vineri", "Sambata", "Duminica"]
+
+
+def fmt_time(ts) -> str:
+    """
+    Formateaza timestamp pt Telegram in TZ-ul `CHART_TZ` (default Europe/Bucharest)
+    cu ziua in RO. `ts` accepta: int seconds, int milliseconds, datetime.
+
+    Output: "Luni, 28.04.2026  17:42"
+    """
+    tz_name = os.getenv("CHART_TZ", "Europe/Bucharest")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Europe/Bucharest")
+
+    if isinstance(ts, datetime):
+        dt = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    else:
+        v = float(ts)
+        if v > 1e12:           # milisecunde
+            v /= 1000.0
+        dt = datetime.fromtimestamp(v, tz=timezone.utc)
+
+    local = dt.astimezone(tz)
+    return f"{_DAYS_RO[local.weekday()]}, {local.strftime('%d.%m.%Y  %H:%M')}"
 
 
 def _header() -> str:

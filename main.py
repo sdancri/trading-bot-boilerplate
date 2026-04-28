@@ -30,10 +30,13 @@ Env vars importante:
   STRATEGY_MODULE      — "strategies.base_strategy" (modulul Python)
   STRATEGY_CLASS       — "NoopStrategy" (numele clasei din modul)
   CHART_PORT           — 8090 (port diferit fata de vechile boturi pe 8080)
-  CHART_TZ             — "Europe/Bucharest"
+  CHART_TZ             — "Europe/Bucharest" (folosit si pe chart si in mesaje TG)
   ACCOUNT_SIZE         — 100.0 (plecarea pt state.account)
   SL_MIN_PCT           — 0.0 (filtru minim SL%)
   SL_MAX_PCT           — 100.0 (filtru maxim SL%)
+  LEVERAGE_MAX         — 10 (cap notional = 0.95 × bybit_balance × LEVERAGE_MAX;
+                              user-ul TREBUIE sa fi setat acelasi leverage in UI Bybit)
+  DATA_DIR             — "" (default: la Restart istoric+equity = 0)
 """
 from __future__ import annotations
 
@@ -427,7 +430,8 @@ async def record_closed_trade(direction:         str,
     await tg.send(
         f"{sign} TRADE INCHIS — {direction}",
         f"<b>Strategy:</b> <code>{strat_name}</code>\n"
-        f"{exit_line}\n"
+        f"Entry: {trade.entry_price:,.{prec}f}  ({tg.fmt_time(trade.entry_ts)})\n"
+        f"{exit_line}  ({tg.fmt_time(trade.exit_ts)})\n"
         f"PnL: <b>${trade.pnl:+,.2f}</b>  (Bybit real, fees incluse)\n"
         f"Account: ${_state.account:,.2f}  |  Return: "
         f"{(_state.account - _state.initial_account) / _state.initial_account * 100:+.2f}%"
@@ -517,7 +521,8 @@ async def _bootstrap() -> None:
         "BOT STARTED ✅",
         f"Strategy: <code>{_strategy.name}</code>\n"
         f"Account init: ${_state.initial_account:,.2f}\n"
-        f"Chart: port {CHART_PORT}"
+        f"Started:      {tg.fmt_time(_state.start_utc)}\n"
+        f"Chart:        port {CHART_PORT}"
     )
 
 
@@ -804,8 +809,9 @@ async def lifespan(app: FastAPI):
             await tg.send(
                 "BOT STOPPED 🛑",
                 f"Strategy: <code>{_strategy.name if _strategy else '?'}</code>\n"
-                f"Account: ${_state.account:,.2f}  |  Return: {ret_pct:+.2f}%\n"
-                f"Trades: {n_trades}"
+                f"Stopped:  {tg.fmt_time(datetime.now(timezone.utc))}\n"
+                f"Account:  ${_state.account:,.2f}  |  Return: {ret_pct:+.2f}%\n"
+                f"Trades:   {n_trades}"
             )
         except Exception as e:
             print(f"  [SHUTDOWN] tg.send failed: {e}")
