@@ -64,7 +64,7 @@ _sys.stderr = _io.TextIOWrapper(_sys.stderr.buffer, encoding="utf-8",
 
 import core.exchange_api as ex
 import core.telegram_bot as tg
-from core.bot_state import BotState, TradeRecord
+from core.bot_state import BotState, ReconciliationError, TradeRecord
 from strategies.base_strategy import Strategy, StrategyContext
 
 
@@ -232,16 +232,115 @@ async def clear_active_position() -> None:
 # Trade recording — trage PnL de pe Bybit, apoi broadcast + Telegram
 # ============================================================================
 
-async def record_closed_trade(direction:   str,
-                              entry_ts_ms: int,
-                              entry_price: float,
-                              sl_price:    float,
-                              tp_price:    Optional[float],
-                              qty:         float,
-                              exit_ts_ms:  int,
-                              exit_price:  float,
-                              exit_reason: str,
-                              extra:       Optional[dict] = None) -> TradeRecord:
+# INVARIANT: acest bot are ownership exclusiv pe simbolurile lui.
+# Reconcilierea via get_position_qty() depinde de asta — daca alt bot
+# tranzactioneaza vreodata acelasi simbol, get_position_qty va fi
+# contaminat si reconcilierea va trigger halt-uri false (sau, mai grav,
+# chase_close va inchide pozitia altui bot).
+_RECONCILE_QTY_EPS    = 1e-9     # toleranta float pe comparatii de qty
+_RECONCILE_RETRIES    = 3        # cate iteratii sa astepte stop-ul de pe Bybit
+_RECONCILE_RETRY_SLEEP = 1.0     # secunde intre check-uri
+
+
+async def _assert_closed(qty_local: float, reason_label: str) -> None:
+    """Verifica ca pozitia e inchisa dupa chase_close. Raise pe esec.
+
+    chase_close are 20 incercari + fallback market, dar nu garanteaza
+    inchiderea (ex: Bybit down complet, ordinele respinse). Fara aceasta
+    verificare, am inregistra trade-ul ca "inchis" cu pozitia inca deschisa.
+    """
+    qty_after = await ex.get_position_qty(SYMBOL)
+    if qty_after <= _RECONCILE_QTY_EPS:
+        return
+    msg = (f"chase_close ({reason_label}) NU a inchis pozitia pe {SYMBOL}: "
+           f"qty_after={qty_after}, qty_local={qty_local}")
+    print(f"  [RECONCILE] HALT: {msg}")
+    await tg.send_critical(
+        f"{SYMBOL} chase_close esuat ({reason_label})",
+        f"<b>Local qty:</b> {qty_local}\n"
+        f"<b>Bybit qty dupa chase:</b> {qty_after}\n"
+        f"chase_close nu a putut inchide pozitia (Bybit down sau order respins). "
+        f"Bot oprit pentru acest simbol. Verifica manual si restart."
+    )
+    raise ReconciliationError(msg)
+
+
+async def _reconcile_close(direction: str,
+                           qty_local: float,
+                           exit_reason: str) -> str:
+    """
+    Confirma cu Bybit ca pozitia s-a inchis si rezolva discrepantele.
+    Returneaza exit_reason-ul final (eventual cu sufix _PARTIAL / _FORCED).
+    Ridica ReconciliationError pe ramura qty_real > qty_local (anomalie)
+    sau daca chase_close esueaza sa inchida pozitia.
+
+    Ramuri (qty_real = pozitie reala pe Bybit, qty_local = qty bot):
+      qty_real == 0            -> Bybit a inchis clean, exit_reason neschimbat
+      0 < qty_real < qty_local -> fill partial, chase_close pe rest, sufix _PARTIAL
+      qty_real ≈ qty_local     -> stop-ul nu s-a triggerit; retry; daca persista, force
+      qty_real > qty_local     -> anomalie; HALT, raise ReconciliationError
+    """
+    qty_real = await ex.get_position_qty(SYMBOL)
+
+    # Ramura 1: clean close (cazul comun)
+    if qty_real <= _RECONCILE_QTY_EPS:
+        return exit_reason
+
+    # Ramura 4: anomalie — qty pe Bybit mai mare decat ce stim local.
+    # NU inchidem automat — am putea inchide hedge manual / pozitia altui bot
+    # / o piramidare necontorizata. Halt + alert + raise.
+    if qty_real > qty_local + _RECONCILE_QTY_EPS:
+        msg = (f"qty_real={qty_real} > qty_local={qty_local} pe {SYMBOL} "
+               f"(exit_reason={exit_reason}). Cauze posibile: piramidare "
+               f"necontorizata, pozitie reziduala dintr-un run anterior, sau "
+               f"interventie manuala. Bot HALTED pe simbol.")
+        print(f"  [RECONCILE] HALT: {msg}")
+        await tg.send_critical(
+            f"{SYMBOL} reconciliere {exit_reason}",
+            f"<b>Local qty:</b> {qty_local}\n"
+            f"<b>Bybit qty:</b> {qty_real}\n"
+            f"<b>Exit reason:</b> {exit_reason}\n"
+            f"Bot oprit pentru acest simbol. Verifica manual si restart."
+        )
+        raise ReconciliationError(msg)
+
+    # Ramura 2: fill partial (0 < qty_real < qty_local) — inchide restul
+    if qty_real < qty_local - _RECONCILE_QTY_EPS:
+        partial_reason = f"{exit_reason}_PARTIAL"
+        print(f"  [RECONCILE] partial: real={qty_real} < local={qty_local} "
+              f"(reason={exit_reason}) — chase_close pe rest")
+        await ex.chase_close(SYMBOL, direction)
+        await _assert_closed(qty_local, partial_reason)
+        return partial_reason
+
+    # Ramura 3: qty_real ≈ qty_local — stop-ul nu s-a triggerit pe Bybit.
+    # Asteptam putin (poate e doar latenta), apoi forcam inchidere.
+    for attempt in range(_RECONCILE_RETRIES):
+        await asyncio.sleep(_RECONCILE_RETRY_SLEEP)
+        qty_real = await ex.get_position_qty(SYMBOL)
+        if qty_real <= _RECONCILE_QTY_EPS:
+            print(f"  [RECONCILE] {exit_reason} a triggerit dupa retry "
+                  f"#{attempt + 1}")
+            return exit_reason
+
+    forced_reason = f"{exit_reason}_FORCED"
+    print(f"  [RECONCILE] {exit_reason} NU s-a triggerit dupa "
+          f"{_RECONCILE_RETRIES} retries — chase_close fortat")
+    await ex.chase_close(SYMBOL, direction)
+    await _assert_closed(qty_local, forced_reason)
+    return forced_reason
+
+
+async def record_closed_trade(direction:         str,
+                              entry_ts_ms:       int,
+                              entry_price:       float,
+                              sl_price:          float,
+                              tp_price:          Optional[float],
+                              qty:               float,
+                              exit_ts_ms:        int,
+                              exit_price_target: float,
+                              exit_reason:       str,
+                              extra:             Optional[dict] = None) -> TradeRecord:
     """
     Helper pe care il apeleaza strategia cand un trade se inchide.
 
@@ -253,16 +352,33 @@ async def record_closed_trade(direction:   str,
       (vezi BotState.add_closed_trade)
 
     Workflow:
-      1. Asteapta 2s (Bybit inregistreaza closed-pnl cu mica latenta)
-      2. fetch_pnl_for_trade() -> PnL real (principal + piramide + fees)
-      3. Construieste TradeRecord cu PnL-ul real
+      1. Reconciliaza cu Bybit: confirma ca pozitia s-a inchis (sau o inchide
+         daca strategia a detectat exit pe candle dar Bybit nu a executat).
+         Ridica ReconciliationError pe anomalie -> strategia trebuie sa intre
+         in HALT pe simbol.
+      2. fetch_pnl_for_trade() -> PnL real + avg_exit (principal + piramide)
+      3. Construieste TradeRecord cu PnL-ul real, exit_price = avg_exit Bybit,
+         exit_price_target = nivelul vizat de strategie (slippage = diferenta).
       4. BotState.add_closed_trade() — equity se recalculeaza LOCAL
       5. Broadcast la toti clientii (refresh panel trades + equity curve)
-      6. Trimite Telegram cu numele botului + strategiei
+      6. Trimite Telegram (slippage afisat doar pe FORCED/PARTIAL)
       7. Cheama strategy.on_trade_closed()
+
+    Raises:
+      ReconciliationError — qty pe Bybit > qty local. NU prinde aici, lasa sa
+                            urce in strategie ca sa seteze _halted.
     """
-    # --- PAS 1+2: trage DOAR PnL-ul, nu balance-ul ---
+    # --- PAS 1: reconciliaza cu Bybit (poate raise ReconciliationError) ---
+    final_exit_reason = await _reconcile_close(direction, qty, exit_reason)
+
+    # --- PAS 2: trage PnL-ul real + avg_exit ---
     pnl_data = await ex.fetch_pnl_for_trade(SYMBOL, entry_ts_ms, exit_ts_ms)
+
+    # exit_price actual: avg_exit weighted din closed-pnl. Daca Bybit nu a
+    # raportat inca (n_fills=0), fallback la target — slippage va fi 0 si
+    # pnl-ul ramane 0 cu warning-ul deja logat in fetch_pnl_for_trade.
+    avg_exit = pnl_data.get("avg_exit", 0.0) or 0.0
+    exit_price_actual = avg_exit if avg_exit > 0 else exit_price_target
 
     # --- PAS 3: construieste TradeRecord ---
     trade = TradeRecord(
@@ -276,8 +392,9 @@ async def record_closed_trade(direction:   str,
         tp_price=tp_price,
         qty=qty,
         exit_ts=exit_ts_ms,
-        exit_price=exit_price,
-        exit_reason=exit_reason,
+        exit_price=exit_price_actual,
+        exit_price_target=exit_price_target,
+        exit_reason=final_exit_reason,
         pnl=pnl_data["pnl"],            # PnL REAL Bybit (USD net dupa fees)
         fees=pnl_data["fees"],
         extra=extra or {},
@@ -298,13 +415,19 @@ async def record_closed_trade(direction:   str,
         "summary": _state.summary(),
     })
 
-    # Telegram
+    # Telegram — actual ca pret principal; slippage afisat ca side info doar
+    # pe FORCED/PARTIAL (pe close clean ar fi zgomot inutil).
     sign = "📈" if trade.pnl >= 0 else "📉"
     strat_name = _strategy.name if _strategy else "?"
+    prec = int(os.getenv('PRICE_PRECISION', '2'))
+    exit_line = f"Exit: {trade.exit_price:,.{prec}f}  ({trade.exit_reason})"
+    if "FORCED" in trade.exit_reason or "PARTIAL" in trade.exit_reason:
+        exit_line += (f"\n  ↳ target: {trade.exit_price_target:,.{prec}f}  "
+                      f"slip: {trade.slippage:+,.{prec}f}")
     await tg.send(
         f"{sign} TRADE INCHIS — {direction}",
         f"<b>Strategy:</b> <code>{strat_name}</code>\n"
-        f"Exit: {exit_price:,.{int(os.getenv('PRICE_PRECISION', '2'))}f}  ({exit_reason})\n"
+        f"{exit_line}\n"
         f"PnL: <b>${trade.pnl:+,.2f}</b>  (Bybit real, fees incluse)\n"
         f"Account: ${_state.account:,.2f}  |  Return: "
         f"{(_state.account - _state.initial_account) / _state.initial_account * 100:+.2f}%"

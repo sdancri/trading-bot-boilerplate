@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import core.exchange_api as ex
+from core.bot_state import ReconciliationError
 from strategies.base_strategy import Strategy, StrategyContext, validate_sl
 
 
@@ -59,6 +60,11 @@ class ExampleStrategy(Strategy):
         self._sl_price:     float = 0.0
         self._tp_price:     float = 0.0
         self._qty:          float = 0.0
+
+        # Halt per-instanta. Setat de _check_sl_tp daca reconcilierea esueaza
+        # (qty real > qty local pe Bybit). Strategia ramane "moarta" pe acest
+        # simbol pana la restart manual — nu se inchide poziția existenta.
+        self._halted:       bool = False
 
     # ------------------------------------------------------------------
     # on_start — WARMUP EMA pe istoric (intern, fara publicare pe chart)
@@ -101,6 +107,11 @@ class ExampleStrategy(Strategy):
     # on_candle — rulata pt fiecare update WS
     # ------------------------------------------------------------------
     async def on_candle(self, ctx: StrategyContext, candle: dict) -> None:
+        # Halt: stare divergenta detectata anterior la reconciliere. Nu mai
+        # facem nimic pe acest simbol pana la restart manual.
+        if self._halted:
+            return
+
         ts        = candle["ts"]
         o         = candle["open"]
         h         = candle["high"]
@@ -220,30 +231,36 @@ class ExampleStrategy(Strategy):
         if not sl_hit and not tp_hit:
             return
 
-        exit_reason = "SL" if sl_hit else "TP"
-        exit_price  = self._sl_price if sl_hit else self._tp_price
+        exit_reason       = "SL" if sl_hit else "TP"
+        exit_price_target = self._sl_price if sl_hit else self._tp_price
 
-        # Daca SL hit — pozitia e deja inchisa de Bybit (SL stop-market)
-        # Daca TP hit — inchide manual cu chase-close (maker)
-        if tp_hit and not sl_hit:
-            await ex.chase_close(self.symbol, self._dir)
-
-        # Inregistreaza trade-ul in framework (PnL tras de pe Bybit automat)
+        # NOTE: framework-ul (record_closed_trade) face reconcilierea cu Bybit:
+        #   - SL hit: confirma ca stop-market-ul s-a triggerit; daca nu, force.
+        #   - TP hit: chase_close + verifica ca a inchis (sau forteaza).
+        # Nu mai apelam chase_close aici — duplicare cu reconcilierea.
         from main import record_closed_trade
-        await record_closed_trade(
-            direction=self._dir,
-            entry_ts_ms=self._entry_ts,
-            entry_price=self._entry_price,
-            sl_price=self._sl_price,
-            tp_price=self._tp_price,
-            qty=self._qty,
-            exit_ts_ms=ts * 1000,
-            exit_price=exit_price,
-            exit_reason=exit_reason,
-            extra={"strategy": self.name},
-        )
+        try:
+            await record_closed_trade(
+                direction=self._dir,
+                entry_ts_ms=self._entry_ts,
+                entry_price=self._entry_price,
+                sl_price=self._sl_price,
+                tp_price=self._tp_price,
+                qty=self._qty,
+                exit_ts_ms=ts * 1000,
+                exit_price_target=exit_price_target,
+                exit_reason=exit_reason,
+                extra={"strategy": self.name},
+            )
+        except ReconciliationError as e:
+            # qty pe Bybit > qty local — anomalie. Telegram critic deja trimis.
+            # Strategia ramane "ocupata" (_in_trade=True) si HALTED, ca sa nu
+            # plaseze ordine peste o stare pe care nu o intelegem.
+            print(f"  [{self.name}] HALTED: {e}")
+            self._halted = True
+            return
 
-        # Reset state
+        # Reset state DOAR daca reconcilierea a confirmat inchiderea.
         self._in_trade = False
         self._dir = None
 

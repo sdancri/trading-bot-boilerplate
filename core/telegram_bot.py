@@ -58,6 +58,22 @@ async def send(title: str, body: str = "") -> None:
     await send_raw(text)
 
 
+async def send_critical(title: str, body: str = "") -> None:
+    """
+    Mesaj CRITIC — prefix vizibil "🚨 HALT" + header standard, acelasi chat.
+    Folosit pentru anomalii care necesita interventie manuala (ex: divergenta
+    intre starea locala si pozitia reala de pe Bybit).
+
+    Cand vei avea TELEGRAM_CHAT_ID_CRITICAL ca env separat, schimbarea e
+    locala aici — restul codului ramane neatins.
+    """
+    safe_title = html.escape(title)
+    text = f"{_header()}\n🚨 <b>HALT — {safe_title}</b>"
+    if body:
+        text += f"\n{body}"
+    await send_raw(text)
+
+
 async def send_raw(text: str) -> None:
     """Trimite text brut (pt cazuri speciale). Respecta HTML parse mode."""
     token   = os.getenv("TELEGRAM_TOKEN",   "")

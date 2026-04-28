@@ -39,9 +39,27 @@ DATA_DIR     = os.getenv("DATA_DIR", "")           # "" -> persistenta dezactiva
 RESET_TOKEN  = os.getenv("RESET_TOKEN", "")        # "" -> niciodata reset
 
 
+class ReconciliationError(Exception):
+    """
+    Stare divergenta intre starea locala a bot-ului si pozitia reala de pe Bybit.
+    Ridicata de record_closed_trade cand qty_real > qty_local — situatie care
+    NU se rezolva safe automat (vezi: piramidare necontorizata, pozitie reziduala
+    dintr-un run anterior, interventie manuala). Strategia trebuie sa intre in
+    HALT pe simbolul afectat pana la review manual + restart.
+    """
+    pass
+
+
 @dataclass
 class TradeRecord:
-    """Trade inchis — PnL-ul vine REAL de pe Bybit."""
+    """Trade inchis — PnL-ul vine REAL de pe Bybit.
+
+    exit_price        — pretul ACTUAL la care s-a iesit (avg_exit din Bybit
+                        closed-pnl). Pe FORCED/PARTIAL include weighted average
+                        peste fill-ul partial + chase_close.
+    exit_price_target — pretul VIZAT de strategie (self._sl_price / _tp_price).
+                        Diferenta dintre cele doua = slippage real vs plan.
+    """
     id:           int
     date:         str                 # "YYYY-MM-DD"
     direction:    str                 # "LONG" / "SHORT"
@@ -51,11 +69,23 @@ class TradeRecord:
     tp_price:     Optional[float]     # None daca strategia nu are TP (ex ORB)
     qty:          float
     exit_ts:      int
-    exit_price:   float
-    exit_reason:  str                 # "TP" / "SL" / "EOD" / "MANUAL"
+    exit_price:   float                # ACTUAL exit (avg_exit Bybit)
+    exit_reason:  str                  # "TP" / "SL" / "SL_FORCED" / "TP_FORCED" / "SL_PARTIAL" / ...
     pnl:          float                # USDT — TRAS DE PE BYBIT (closed-pnl endpoint)
     fees:         float                = 0.0
+    exit_price_target: float           = 0.0   # SL/TP vizat de strategie (0 = legacy/necunoscut)
     extra:        dict                 = field(default_factory=dict)  # meta strategia
+
+    @property
+    def slippage(self) -> float:
+        """Slippage vs target. Conventie: pozitiv = mai prost decat target,
+        negativ = mai bun. Aplicabil la LONG si SHORT uniform.
+        Returneaza 0.0 daca target sau actual lipsesc (legacy records)."""
+        if self.exit_price_target <= 0 or self.exit_price <= 0:
+            return 0.0
+        if self.direction == "LONG":
+            return self.exit_price_target - self.exit_price
+        return self.exit_price - self.exit_price_target
 
     def to_dict(self) -> dict:
         """Format pentru chart_template.py & JSON API."""
@@ -72,6 +102,8 @@ class TradeRecord:
             "size_usdt":   round(self.qty * self.entry_price, 2),
             "exit_ms":     self.exit_ts,
             "exit_price":  round(self.exit_price, 4),
+            "exit_price_target": round(self.exit_price_target, 4),
+            "slippage":    round(self.slippage, 4),
             "exit_reason": self.exit_reason,
             "pnl":         round(self.pnl, 4),
             "fees":        round(self.fees, 4),
@@ -91,6 +123,7 @@ class TradeRecord:
             "qty":         self.qty,
             "exit_ts":     self.exit_ts,
             "exit_price":  self.exit_price,
+            "exit_price_target": self.exit_price_target,
             "exit_reason": self.exit_reason,
             "pnl":         self.pnl,
             "fees":        self.fees,
@@ -99,11 +132,15 @@ class TradeRecord:
 
     @classmethod
     def from_dict(cls, d: dict) -> 'TradeRecord':
+        # Legacy persisted records (pre-reconciliation): foloseau exit_price ca
+        # target. Tratam exit_price_target lipsa ca egal cu exit_price -> slippage=0.
+        exit_price = d["exit_price"]
         return cls(
             id=d["id"], date=d["date"], direction=d["direction"],
             entry_ts=d["entry_ts"], entry_price=d["entry_price"],
             sl_price=d["sl_price"], tp_price=d.get("tp_price"),
-            qty=d["qty"], exit_ts=d["exit_ts"], exit_price=d["exit_price"],
+            qty=d["qty"], exit_ts=d["exit_ts"], exit_price=exit_price,
+            exit_price_target=d.get("exit_price_target", exit_price),
             exit_reason=d["exit_reason"], pnl=d["pnl"],
             fees=d.get("fees", 0.0), extra=d.get("extra") or {},
         )
