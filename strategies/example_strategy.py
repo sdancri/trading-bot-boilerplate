@@ -226,6 +226,12 @@ class ExampleStrategy(Strategy):
         self._tp_price    = tp
         self._qty         = qty
 
+        # Publish active position pe chart — linii Entry/SL/TP live + uPnL ($, R)
+        # Persista in /api/init la refresh browser. Cleared in _check_sl_tp dupa
+        # ce reconcilierea confirma inchiderea.
+        await ctx.set_active_position(direction, entry, sl, tp,
+                                       qty=qty, risk_usd=snap["actual_risk"])
+
         # Asset de baza pt afisare. Normalizeaza la uppercase si scoate sufix
         # `.P` (TradingView perp notation), apoi taie quote-ul:
         #   BTCUSDT          -> BTC
@@ -310,6 +316,8 @@ class ExampleStrategy(Strategy):
             return
 
         # Reset state DOAR daca reconcilierea a confirmat inchiderea.
+        # Sterge si liniile active de pe chart (Entry/SL/TP).
+        await ctx.clear_active_position()
         self._in_trade = False
         self._dir = None
 
