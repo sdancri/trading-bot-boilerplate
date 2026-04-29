@@ -654,6 +654,9 @@ async def _fetch_gap_bars(after_ts_s: int, before_ts_s: int) -> list[dict]:
     return bars
 
 
+_LAST_PROCESSED_TS: dict[bool, int] = {True: 0, False: 0}
+
+
 async def _process_bar(ts_s: int, o: float, h: float, l: float, c: float,
                        confirmed: bool) -> None:
     """
@@ -662,7 +665,16 @@ async def _process_bar(ts_s: int, o: float, h: float, l: float, c: float,
     - append la _candles (daca confirmed)
     - broadcast la clienti
     - chema strategy.on_candle()
+
+    Dedup defensive: WS poate livra bare duplicate (retransmit pe reconnect,
+    sync REST overlap, etc.) Track ultimul ts procesat per (confirmed-flag) și
+    skip dacă ts e <= ultimul. Strategy primește fiecare bara doar O DATĂ.
     """
+    global _LAST_PROCESSED_TS
+    if ts_s <= _LAST_PROCESSED_TS[confirmed]:
+        return
+    _LAST_PROCESSED_TS[confirmed] = ts_s
+
     _state.mark_first_candle(ts_s)
 
     prec = int(os.getenv("PRICE_PRECISION", "2"))

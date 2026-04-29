@@ -10,22 +10,27 @@ services:
     # Stacks). Sintaxa ${VAR:-default} de mai jos face stack-ul compatibil
     # cu ambele: vine din .env LOCAL, sau din UI-ul Portainer.
     env_file: .env
+    # IMPORTANT — format LISTA (`- KEY=VALUE`), NU format mapping (`KEY: VALUE`).
+    # Portainer Stacks YAML parser respinge formatul mapping cu eroarea
+    # "A collection cannot be both a mapping and a sequence" cand exista
+    # sectiuni mixte (ports = lista, environment = mapping). Lista e robusta
+    # in toate parserele (compose CLI, Portainer, Swarm, k8s).
     environment:
-      BOT_NAME:          ${BOT_NAME:-trading-bot}
-      SYMBOL:            ${SYMBOL:-BTCUSDT}
-      STRATEGY_NAME:     ${STRATEGY_NAME:-}
-      STRATEGY_MODULE:   ${STRATEGY_MODULE:-strategies.example_strategy}
-      STRATEGY_CLASS:    ${STRATEGY_CLASS:-ExampleStrategy}
-      CHART_PORT:        ${CHART_PORT:-8090}
-      CHART_TZ:          ${CHART_TZ:-Europe/Bucharest}
-      ACCOUNT_SIZE:      ${ACCOUNT_SIZE:-100.0}
-      DATA_DIR:          ${DATA_DIR:-/data}
-      RESET_TOKEN:       ${RESET_TOKEN:-}
-      BYBIT_API_KEY:     ${BYBIT_API_KEY:-}
-      BYBIT_API_SECRET:  ${BYBIT_API_SECRET:-}
-      TELEGRAM_TOKEN:    ${TELEGRAM_TOKEN:-}
-      TELEGRAM_CHAT_ID:  ${TELEGRAM_CHAT_ID:-}
-      TZ:                ${TZ:-Europe/Bucharest}
+      - BOT_NAME=${BOT_NAME:-trading-bot}
+      - SYMBOL=${SYMBOL:-BTCUSDT}
+      - STRATEGY_NAME=${STRATEGY_NAME:-}
+      - STRATEGY_MODULE=${STRATEGY_MODULE:-strategies.example_strategy}
+      - STRATEGY_CLASS=${STRATEGY_CLASS:-ExampleStrategy}
+      - CHART_PORT=${CHART_PORT:-8090}
+      - CHART_TZ=${CHART_TZ:-Europe/Bucharest}
+      - ACCOUNT_SIZE=${ACCOUNT_SIZE:-100.0}
+      - DATA_DIR=${DATA_DIR:-/data}
+      - RESET_TOKEN=${RESET_TOKEN:-}
+      - BYBIT_API_KEY=${BYBIT_API_KEY:-}
+      - BYBIT_API_SECRET=${BYBIT_API_SECRET:-}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TZ=${TZ:-Europe/Bucharest}
     ports:
       - "${CHART_PORT:-8090}:${CHART_PORT:-8090}"
     volumes:

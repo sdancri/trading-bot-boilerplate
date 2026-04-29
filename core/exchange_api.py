@@ -525,21 +525,29 @@ async def set_position_sl(symbol: str, sl_price: float) -> None:
     plaseaza un LIMIT order @ tp_limit_price → maker fee 0.020% in loc
     de 0.055% taker. SL ramane Market pt siguranta.
 
-    Exemplu payload (LONG, entry=$100, SL=$97, TP=$104):
+    CONSTRAINT BYBIT: `tpOrderType=Limit` necesita `tpslMode=Partial` cu
+    `tpSize`/`slSize` explicite. Combinatia `tpslMode=Full` + `tpOrderType=Limit`
+    e respinsa cu eroare "tpOrderType only support Market when tpSlMode is Full".
+    Cu tpSize/slSize = qty pozitiei, Partial e echivalent functional cu Full.
+
+    Exemplu payload (LONG, entry=$100, SL=$97, TP=$104, qty=1.5):
 
         await _post("/v5/position/set-trading-stop", {
             "category":     "linear",
             "symbol":       "ETHUSDT",
             "positionIdx":  0,
+            "tpslMode":     "Partial",  # obligatoriu pt TP Limit
             # SL = market (siguranta)
             "stopLoss":     "97.00",
             "slTriggerBy":  "LastPrice",
             "slOrderType":  "Market",
+            "slSize":       "1.5",
             # TP = limit (maker fee)
             "takeProfit":   "104.00",
             "tpTriggerBy":  "LastPrice",
             "tpOrderType":  "Limit",
             "tpLimitPrice": "103.95",   # ~0.05% mai prost ca trigger pt fill prob
+            "tpSize":       "1.5",
         })
 
     Pentru SHORT: simetric, tpLimitPrice cu ~0.05% mai sus decat trigger.
