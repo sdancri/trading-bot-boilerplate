@@ -34,6 +34,7 @@ Campuri asteptate per trade (dict sau obiect cu atribute):
 from __future__ import annotations
 
 import json
+import math
 import webbrowser
 from pathlib import Path
 from typing import Union
@@ -88,6 +89,26 @@ class ChartDisplay:
         self.tz = tz
         self.initial_capital = initial_capital
         self._prepare_df()
+        self.price_precision = self._detect_price_precision()
+        self.price_min_move  = 10 ** (-self.price_precision)
+
+    # -- precizie pret auto (~5 cifre semnificative) -------------------------
+    def _detect_price_precision(self) -> int:
+        try:
+            cols = [c for c in ("open", "high", "low", "close") if c in self.df.columns]
+            if not cols:
+                return 4
+            prices = pd.concat([self.df[c] for c in cols]).astype(float)
+            prices = prices[prices > 0]
+            if prices.empty:
+                return 4
+            ref = float(prices.min())
+            if not math.isfinite(ref) or ref <= 0:
+                return 4
+            magnitude = math.floor(math.log10(ref))
+            return max(2, min(8, 4 - magnitude))
+        except Exception:
+            return 4
 
     # -- normalizare DataFrame -----------------------------------------------
     def _prepare_df(self):
@@ -107,6 +128,7 @@ class ChartDisplay:
 
     # -- serializa date chart ------------------------------------------------
     def _candles_json(self) -> str:
+        p = self.price_precision
         rows = []
         for ts, row in self.df.iterrows():
             day_ro = _DAYS_RO[pd.Timestamp(ts).weekday()]
@@ -117,10 +139,10 @@ class ChartDisplay:
                 tooltip = str(ts)
             rows.append({
                 "time":    _ts_ms(ts),
-                "open":    round(float(row["open"]),  4),
-                "high":    round(float(row["high"]),  4),
-                "low":     round(float(row["low"]),   4),
-                "close":   round(float(row["close"]), 4),
+                "open":    round(float(row["open"]),  p),
+                "high":    round(float(row["high"]),  p),
+                "low":     round(float(row["low"]),   p),
+                "close":   round(float(row["close"]), p),
                 "tooltip": tooltip,
             })
         return json.dumps(rows)
@@ -143,14 +165,15 @@ class ChartDisplay:
             size_usdt   = qty * entry_price
             pnl_pct     = pnl / self.initial_capital * 100
 
+            p = self.price_precision
             result.append({
                 "id":          i + 1,
                 "entry_ms":    _ts_ms(entry_time),
                 "exit_ms":     _ts_ms(exit_time) if exit_time else None,
                 "side":        side,
-                "entry_price": round(entry_price, 4),
-                "sl":          round(sl, 4),
-                "tp":          round(tp, 4),
+                "entry_price": round(entry_price, p),
+                "sl":          round(sl, p),
+                "tp":          round(tp, p),
                 "size_usdt":   round(size_usdt, 2),
                 "pnl":         round(pnl, 4),
                 "pnl_pct":     round(pnl_pct, 4),
@@ -165,6 +188,8 @@ class ChartDisplay:
         candles_json = self._candles_json()
         trades_json  = self._trades_json()
         init_cap     = self.initial_capital
+        precision    = self.price_precision
+        min_move_str = f"{self.price_min_move:.{precision}f}"
 
         html = f"""<!DOCTYPE html>
 <html lang="ro">
@@ -342,6 +367,8 @@ class ChartDisplay:
 const CANDLES = {candles_json};
 const TRADES  = {trades_json};
 const INIT_CAP = {init_cap};
+const PRICE_PRECISION = {precision};
+const PRICE_MIN_MOVE  = {min_move_str};
 
 // -- Lightweight Charts ----------------------------------------------------
 const wrapChart = document.getElementById('wrap-chart');
@@ -388,6 +415,11 @@ const candleSeries = chart.addCandlestickSeries({{
   borderDownColor:'#ff3352',
   wickUpColor:    '#00e676',
   wickDownColor:  '#ff3352',
+  priceFormat: {{
+    type:      'price',
+    precision: PRICE_PRECISION,
+    minMove:   PRICE_MIN_MOVE,
+  }},
 }});
 const chartData = CANDLES.map(c => ({{
   time: c.time / 1000, open: c.open, high: c.high, low: c.low, close: c.close
@@ -461,10 +493,10 @@ chart.subscribeCrosshairMove(param => {{
   tooltipEl.innerHTML =
     '<div class="tt-date">' + bar.tooltip + '</div>' +
     '<div class="tt-ohlc">' +
-      'O <span class="tt-val">' + d.open.toFixed(2)  + '</span>  ' +
-      'H <span class="tt-val" style="color:#00e676">' + d.high.toFixed(2)  + '</span>  ' +
-      'L <span class="tt-val" style="color:#ff3352">' + d.low.toFixed(2)   + '</span>  ' +
-      'C <span class="tt-val">' + d.close.toFixed(2) + '</span>' +
+      'O <span class="tt-val">' + d.open.toFixed(PRICE_PRECISION)  + '</span>  ' +
+      'H <span class="tt-val" style="color:#00e676">' + d.high.toFixed(PRICE_PRECISION)  + '</span>  ' +
+      'L <span class="tt-val" style="color:#ff3352">' + d.low.toFixed(PRICE_PRECISION)   + '</span>  ' +
+      'C <span class="tt-val">' + d.close.toFixed(PRICE_PRECISION) + '</span>' +
     '</div>';
   tooltipEl.style.display = 'block';
 }});
