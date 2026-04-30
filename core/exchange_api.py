@@ -114,7 +114,13 @@ async def _post(endpoint: str, body: dict) -> Optional[dict]:
             r = await c.post(f"{_base()}{endpoint}",
                              headers=_sign(key, secret, body_str),
                              content=body_str)
-            d = r.json()
+            try:
+                d = r.json()
+            except Exception as je:
+                # Body gol / non-JSON — log status + primii 200 chars (debug auth, 5xx, WAF)
+                print(f"  [BYBIT] {endpoint}  HTTP {r.status_code} non-JSON body: "
+                      f"{(r.text or '<empty>')[:200]!r}  ({je})")
+                return None
         if d.get("retCode") != 0:
             print(f"  [BYBIT] {endpoint}  {d['retCode']}: {d['retMsg']}")
             return None
@@ -272,7 +278,14 @@ async def fetch_pnl_for_trade(symbol: str,
       1. Asteapta `settle_delay_sec` — Bybit nevoie de cateva secunde pana
          inregistreaza closed-pnl pe endpoint
       2. Fetch closed-pnl cu startTime = entry_ts_ms - 1 minut (marja)
-      3. Suma `closedPnl` pentru toate inregistrarile cu updatedTime <= exit + 2min
+      3. Suma `closedPnl` pentru toate inregistrarile cu updatedTime in
+         fereastra de filtrare (~entry-60s pana exit+5min)
+
+    Bybit closed-pnl indexing lag: 5-30s tipic, ocazional pana la ~60s pe
+    forced chase_close. Daca primul query intoarce relevant=[], facem retry
+    cu backoff: 2s, 5s, 10s (total ~17s extra wait). Strategiile care nu
+    seteaza TP pe Bybit (TP monitor in cod) ajung mereu pe ramura forced —
+    pentru ele retry-ul e critic.
 
     Returneaza:
       {
@@ -287,20 +300,35 @@ async def fetch_pnl_for_trade(symbol: str,
     if settle_delay_sec > 0:
         await asyncio.sleep(settle_delay_sec)
 
-    # Marja: incepem cu 60s inainte de entry, terminam cu 120s dupa exit
+    # Marja: incepem cu 60s inainte de entry, terminam cu 5min dupa exit
+    # (acopera chase_close lent + indexing lag Bybit)
     start_ms = entry_ts_ms - 60_000
-    end_limit_ms = exit_ts_ms + 120_000
+    end_limit_ms = exit_ts_ms + 300_000
 
-    records = await fetch_closed_pnl(symbol, start_ms=start_ms, limit=50)
-
-    relevant = [
-        r for r in records
-        if start_ms <= int(r.get("updatedTime", 0)) <= end_limit_ms
-    ]
+    records: list = []
+    relevant: list = []
+    for attempt, retry_delay in enumerate([0, 2.0, 5.0, 10.0]):
+        if retry_delay > 0:
+            await asyncio.sleep(retry_delay)
+        records = await fetch_closed_pnl(symbol, start_ms=start_ms, limit=50)
+        relevant = [
+            r for r in records
+            if start_ms <= int(r.get("updatedTime", 0)) <= end_limit_ms
+        ]
+        if relevant:
+            if attempt > 0:
+                print(f"  [BYBIT] closed-pnl gasit dupa retry #{attempt} "
+                      f"({len(relevant)} records)")
+            break
+        if attempt < 3:
+            print(f"  [BYBIT] closed-pnl gol (retry {attempt + 1}/3 in "
+                  f"{[2.0, 5.0, 10.0][attempt]:g}s)  records_total={len(records)}")
 
     if not relevant:
         print(f"  [BYBIT] WARNING: niciun closed-pnl pentru trade "
-              f"{entry_ts_ms}-{exit_ts_ms}  (size-ul ar putea fi 0)")
+              f"{entry_ts_ms}-{exit_ts_ms} dupa 4 incercari (~17s)  "
+              f"records_in_response={len(records)}  "
+              f"window=[{start_ms},{end_limit_ms}]")
         return {"pnl": 0.0, "fees": 0.0, "n_fills": 0,
                 "avg_entry": 0.0, "avg_exit": 0.0, "raw": []}
 
@@ -560,14 +588,37 @@ async def set_position_sl(symbol: str, sl_price: float) -> None:
     NU folosi tpOrderType=Limit fara tpLimitPrice — Bybit returneaza eroare
     sau plaseaza limit-ul exact la trigger (maker incert daca pretul nu
     continua sa miste in directia ta).
+
+    RACE CONDITION place_market -> set_position_sl: place_market returneaza
+    cand order-ul e creat, dar Bybit poate avea cateva sute de ms intarziere
+    pana cand pozitia apare ca activa. Daca apelam set-trading-stop pe o
+    pozitie care nu exista inca, endpoint-ul intoarce body gol/non-JSON
+    ("Expecting value" la json()). Retry de 3x cu backoff 1s/2s/4s acopera
+    fereastra (~7s total) — suficient pt 99% din cazuri.
     """
-    await _post("/v5/position/set-trading-stop", {
+    payload = {
         "category":    _cat(),
         "symbol":      symbol,
         "stopLoss":    _fmt_price(sl_price),
         "slTriggerBy": "LastPrice",
         "positionIdx": 0,
-    })
+    }
+    for attempt, delay in enumerate([0, 1.0, 2.0, 4.0]):
+        if delay > 0:
+            await asyncio.sleep(delay)
+        r = await _post("/v5/position/set-trading-stop", payload)
+        if r is not None:
+            if attempt > 0:
+                print(f"  [BYBIT] set_position_sl OK dupa retry #{attempt}")
+            return
+        print(f"  [BYBIT] set_position_sl FAIL #{attempt + 1}/4 — retry in "
+              f"{[1.0, 2.0, 4.0, 0][attempt]:g}s")
+    print(f"  [BYBIT] set_position_sl FAILED definitiv pe {symbol} sl={sl_price} — "
+          f"POZITIA RULEAZA FARA SL!")
+    # Nu ridicam exception aici — strategia a luat deja entry; halt-ul ar lasa
+    # pozitia deschisa fara protectie. Caller-ul (record_closed_trade reconcile)
+    # va detecta ca SL nu se va trigerui niciodata si va force chase_close.
+    return
 
 
 # ============================================================================
