@@ -230,7 +230,8 @@ class ExampleStrategy(Strategy):
         # Persista in /api/init la refresh browser. Cleared in _check_sl_tp dupa
         # ce reconcilierea confirma inchiderea.
         await ctx.set_active_position(direction, entry, sl, tp,
-                                       qty=qty, risk_usd=snap["actual_risk"])
+                                       qty=qty, risk_usd=snap["actual_risk"],
+                                       entry_ms=self._entry_ts)
 
         # Asset de baza pt afisare. Normalizeaza la uppercase si scoate sufix
         # `.P` (TradingView perp notation), apoi taie quote-ul:

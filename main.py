@@ -44,6 +44,7 @@ import asyncio
 import importlib
 import io as _io
 import json
+import math
 import os
 import sys as _sys
 import time as time_mod
@@ -199,13 +200,17 @@ async def push_indicator(name: str, ts_s: int, value: float) -> None:
 async def set_active_position(direction: str, entry: float,
                               sl: float, tp: float,
                               qty: Optional[float] = None,
-                              risk_usd: Optional[float] = None) -> None:
+                              risk_usd: Optional[float] = None,
+                              entry_ms: Optional[int] = None) -> None:
     """
     Apelata de strategie la _open() — memoreaza pozitia deschisa si o
     broadcast-eaza la toti clientii (chart deseneaza liniile LIVE).
 
     qty si risk_usd sunt OPTIONALE — daca strategia le furnizeaza,
     chart-ul afiseaza uPnL live ($ + R-multiple) in timpul trade-ului.
+
+    entry_ms (ms UTC) — opțional; default = wall clock now. Folosit de chart
+    ca să deseneze liniile Entry/SL/TP doar din momentul deschiderii.
     """
     global _active_position
     _active_position = {
@@ -213,6 +218,7 @@ async def set_active_position(direction: str, entry: float,
         "entry":     float(entry),
         "sl":        float(sl),
         "tp":        float(tp),
+        "entry_ms":  int(entry_ms) if entry_ms is not None else int(time_mod.time() * 1000),
     }
     if qty is not None:
         _active_position["qty"] = float(qty)
@@ -654,7 +660,7 @@ async def _fetch_gap_bars(after_ts_s: int, before_ts_s: int) -> list[dict]:
     return bars
 
 
-_LAST_PROCESSED_TS: dict[bool, int] = {True: 0, False: 0}
+_LAST_CONFIRMED_TS: int = 0
 
 
 async def _process_bar(ts_s: int, o: float, h: float, l: float, c: float,
@@ -666,19 +672,32 @@ async def _process_bar(ts_s: int, o: float, h: float, l: float, c: float,
     - broadcast la clienti
     - chema strategy.on_candle()
 
-    Dedup defensive: WS poate livra bare duplicate (retransmit pe reconnect,
-    sync REST overlap, etc.) Track ultimul ts procesat per (confirmed-flag) și
-    skip dacă ts e <= ultimul. Strategy primește fiecare bara doar O DATĂ.
+    Dedup defensive DOAR pentru confirmed: WS poate livra bare confirmed
+    duplicate (retransmit pe reconnect, sync REST overlap). Fiecare bara
+    confirmed are ts unic, deci `<=` filtreaza corect.
+
+    Pentru unconfirmed NU dedup-uim: toate tick-urile intra-bar din Bybit
+    impart acelasi ts_s (open al barei), deci un dedup pe ts_s ar bloca toate
+    update-urile in afara primului — chart-ul ar vedea bara doar la open si
+    la close.
     """
-    global _LAST_PROCESSED_TS
-    if ts_s <= _LAST_PROCESSED_TS[confirmed]:
-        return
-    _LAST_PROCESSED_TS[confirmed] = ts_s
+    global _LAST_CONFIRMED_TS
+    if confirmed:
+        if ts_s <= _LAST_CONFIRMED_TS:
+            return
+        _LAST_CONFIRMED_TS = ts_s
 
     _state.mark_first_candle(ts_s)
 
-    prec = int(os.getenv("PRICE_PRECISION", "2"))
     if confirmed:
+        # Auto-precision (~5 cifre semnificative) ca sa nu colapseze OHLC-ul
+        # pentru simboluri sub 1$. Override cu env PRICE_PRECISION daca e setat.
+        env_prec = os.getenv("PRICE_PRECISION")
+        if env_prec:
+            prec = int(env_prec)
+        else:
+            ref = c if c and math.isfinite(c) and c > 0 else 1.0
+            prec = max(2, min(8, 4 - math.floor(math.log10(ref))))
         _candles.append([ts_s,
                          round(o, prec), round(h, prec),
                          round(l, prec), round(c, prec)])
