@@ -272,14 +272,18 @@ let initDone = false;
 // ============================================================================
 // Bucharest formatters
 // ============================================================================
+const DAYS_RO_MAP = {
+  "Mon": "Luni",   "Tue": "Marti", "Wed": "Miercuri", "Thu": "Joi",
+  "Fri": "Vineri", "Sat": "Sambata", "Sun": "Duminica",
+};
 function fmtDateTZ(tsSec) {
-  const parts = new Intl.DateTimeFormat("ro-RO", {
-    timeZone: CHART_TZ, weekday: "long",
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: CHART_TZ, weekday: "short",
     day: "2-digit", month: "2-digit", year: "numeric",
     hour: "2-digit", minute: "2-digit", hour12: false,
   }).formatToParts(new Date(tsSec * 1000));
   const m = {}; parts.forEach(p => m[p.type] = p.value);
-  const wd = (m.weekday || "").replace(/^./, ch => ch.toUpperCase());
+  const wd = DAYS_RO_MAP[m.weekday] || m.weekday || "";
   return `${wd}, ${m.day}.${m.month}.${m.year}  ${m.hour}:${m.minute}`;
 }
 function fmtTimeTZ(tsSec) {
