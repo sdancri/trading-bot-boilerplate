@@ -300,10 +300,13 @@ async def fetch_pnl_for_trade(symbol: str,
     if settle_delay_sec > 0:
         await asyncio.sleep(settle_delay_sec)
 
-    # Marja: incepem cu 60s inainte de entry, terminam cu 5min dupa exit
-    # (acopera chase_close lent + indexing lag Bybit)
+    # Marja: incepem cu 60s inainte de entry. Pentru sfarsit luam max intre
+    # `exit_ts_ms + 5min` si `now + 60s` — exit_ts_ms vine de la strategie ca
+    # bar OPEN ts, dar fill-ul real (mai ales pe SL_FORCED dupa chase_close de
+    # ~60s) poate fi mult mai tarziu pe wall-clock. Folosim wall-clock-ul
+    # actual ca limita superioara a indexarii closed-pnl Bybit.
     start_ms = entry_ts_ms - 60_000
-    end_limit_ms = exit_ts_ms + 300_000
+    end_limit_ms = max(exit_ts_ms + 300_000, int(time.time() * 1000) + 60_000)
 
     records: list = []
     relevant: list = []
